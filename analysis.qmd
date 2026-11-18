@@ -1,0 +1,249 @@
+---
+title: "Analysis: Disorganized Schizotypy and Experiences"
+format:
+  html:
+    toc: true
+    toc-depth: 6
+execute: 
+ warning: FALSE
+---
+
+# Preparation
+## Load Packages
+```{r}
+pacman::p_load(tidyverse, haven, ctsem)
+```
+
+## Import Raw Dataset
+```{r}
+org_data <- read_sav("data/tk_2020.sav")
+data <- org_data
+```
+
+### Rename Dataset
+```{r}
+names(data) <- tolower(names(data))
+```
+
+### Subset Dataset
+
+```{r}
+data <- data %>%
+    select(
+        # Demo, Markers
+        id, day, beep, date, time,
+        # Disorganized Schizotypy
+        zdis,
+        # Stressful Situations
+        esm25,
+        # Negative Affect
+        esm02, esm03, esm06,
+        # Disorganized Experiences
+        esm04, esm07, esm10
+    )
+```
+
+## Create Time Variable
+
+```{r}
+data <- data %>%
+  mutate(
+    datetime = as_datetime(date) + time 
+  ) %>%
+  group_by(id) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(
+    time_hour = as.numeric(difftime(datetime, first(datetime), units = "hours"))
+  ) %>%
+  mutate(
+    time_day = as.numeric(difftime(datetime, first(datetime), units = "days"))
+  ) %>%
+  ungroup()
+```
+
+### Drop Missing Time
+```{r}
+org_count <- data %>%
+  nrow()
+org_count
+clean_count <- data %>% 
+  filter(!is.na(time_day)) %>%
+  nrow()
+clean_count
+
+org_count - clean_count
+```
+
+:::callout-note
+We only lost 36 responses, miniscule.
+:::
+
+```{r}
+data <- data %>% 
+  filter(!is.na(time_day))
+```
+
+```{r}
+data <- data %>%
+  group_by(id) %>%
+  mutate(time_day = time_day + (ave(time_day, time_day, FUN = seq_along) - 1) / 1440) %>%
+  ungroup() %>%
+  arrange(id, time_day) %>%
+  mutate(across(c(zdis,
+        # Stressful Situations
+        esm25,
+        # Negative Affect
+        esm02, esm03, esm06,
+        # Disorganized Experiences
+        esm04, esm07, esm10), as.numeric)) %>%
+  as.data.frame()
+```
+
+# Descriptives
+## What is N?
+```{r}
+n_distinct(data$id)
+```
+
+### Create Composite Variables
+
+```{r}
+data <- data %>%
+    mutate(esm_na = rowMeans(across(c(esm02, esm03, esm06)), na.rm = F)) %>%
+     mutate(esm_dis = rowMeans(across(c(esm04, esm07, esm10)), na.rm = F))
+```
+
+
+## All Variables
+
+```{r}
+tidySEM::descriptives(data) %>%
+  select(name, n, missing, unique, mean, sd, min, max, range, skew, kurt) %>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  DT::datatable()
+```
+
+# Visualization
+
+```{r}
+#| include: false
+# cust function
+bar_pct <- function(data, var) {
+  ggplot(data, aes({{ var }})) +
+    geom_bar(aes(y = after_stat(count / sum(count) * 100))) +
+    geom_text(aes(y = after_stat(count / sum(count) * 100),
+                  label = after_stat(paste0(round(count / sum(count) * 100, 1), "%"))),
+              stat = "count", vjust = -0.3) +
+    labs(y = "Percent") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+}
+```
+## Composite Variables
+
+```{r}
+library(patchwork)
+bar_pct(data, esm_na) +
+bar_pct(data, esm_dis)
+```
+## Items
+### Negative Affect
+
+```{r}
+(bar_pct(data, esm02) +
+bar_pct(data, esm03) +
+bar_pct(data, esm06)) +
+  plot_layout(ncol = 2)
+```
+
+### Disorganized Experiences
+
+```{r}
+(bar_pct(data, esm04) +
+bar_pct(data, esm07) +
+bar_pct(data, esm10)) +
+  plot_layout(ncol = 2)
+```
+
+### Stressful Situation
+
+```{r}
+bar_pct(data, esm25)
+```
+
+# Analysis
+## SSIT-NA
+### Model Specification
+
+```{r}
+ssit_na_mod <- ctModel(
+    type = "ct",
+    id = "id",
+    time = "time_day",
+    manifestNames = c("esm25", "esm_dis"),
+    latentNames = c("ssit", "dis", "ssit_trend", "dis_trend"),
+    TIpredNames = c("zdis"),
+    tipredDefault = FALSE,                               
+    manifesttype = c(4,4),
+    censormin    = c(1, 1),
+    censormax    = c(7, 7),
+    RESPONSE     = matrix(c(
+                0.5, 1,  # esm25: single item, steps of 1  -> halfwidth 1/2
+                1/6, 1), # esm_dis: mean of 3, steps of 1/3 -> halfwidth 1/6
+    nrow = 2, byrow = TRUE),
+    # Now we will specify the model
+    LAMBDA = cbind(diag(2), diag(2)),
+    DRIFT = matrix(c( # Y_X = Y <- X
+        "ssit_ssit, indvarying=TRUE, tipreds=zdis", "ssit_dis, indvarying=TRUE, tipreds=zdis", 0, 0,
+        "dis_ssit, indvarying=TRUE, tipreds=zdis", "dis_dis, indvarying=TRUE, tipreds=zdis", 0, 0,
+        0, 0, "ssit_trend_drift", 0,
+        0, 0, 0, "dis_trend_drift"),
+        4, 4, byrow = T),
+    # DIFFUSION
+    DIFFUSION = matrix(c(
+        "diff_ssit", 0, 0, 0,
+        "diff_dis_ssit", "diff_dis", 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0),
+        4, 4, byrow = T),
+    # T0VAR 
+    T0VAR = matrix(c(
+        "T0var_ssit",     0,           0, 0,
+    "T0cov_dis_ssit", "T0var_dis", 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0),
+        4, 4, byrow = T),
+    T0MEANS = c(0, 0, "T0m_ssit_trend, tipreds=zdis", "T0m_dis_trend, tipreds=zdis"),
+    CINT = c(0, 0, "cint_ssit_trend, tipreds=zdis", "cint_dis_trend, tipreds=zdis"),
+    MANIFESTMEANS = 0,
+    MANIFESTVAR = matrix(c(
+            0, 0,
+            0, 0),
+            2,2, byrow = T)
+    )
+```
+
+### Run Model
+
+```{r}
+#| eval: false
+ssit_na_fit <- ctFit(
+  datalong = data,
+  model    = ssit_na_mod,
+  optimize = FALSE,                 # sample the posterior (NUTS) instead of optimizing
+  priors   = TRUE,                  # needed for sampling; ctsem warns without it
+  cores    = 10,                    # total CPU budget across all chains
+  sampleControl = list(
+    chains     = 4,
+    iter       = 2000,              # warmup + sampling per chain
+    warmup     = 1000,              # 1000 burn-in, 1000 kept per chain
+    minESS     = 200,               # stop target: worst parameter's ESS ≥ 200
+    rhatTarget = 1.01,              # stop target: R-hat ≤ 1.01
+    processes  = T,              # run the 4 chains in parallel worker processes
+    seed       = 2026
+  ),
+  verbose = 1                       # progress output
+)
+
+saveRDS(ssit_na_fit, "model_objects/ssit_na_fit.rds")
+beepr::beep(8)
+```
